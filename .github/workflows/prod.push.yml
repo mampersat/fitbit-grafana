@@ -2,6 +2,9 @@ name: Build and Push Docker Images
 
 on:
   workflow_dispatch:
+  release:
+    types:
+      - published
   push:
     branches:
       - '**'
@@ -42,17 +45,20 @@ jobs:
         run: |
           GHCR_OWNER=$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')
           GHCR_IMAGE="ghcr.io/${GHCR_OWNER}/fitbit-fetch-data"
-          LATEST_GIT_TAG=$(git describe --tags --abbrev=0 2>/dev/null || true)
+          EVENT_NAME="${{ github.event_name }}"
+          RELEASE_TAG="${{ github.event.release.tag_name }}"
 
           {
             echo "ghcr_image=${GHCR_IMAGE}"
-            echo "latest_git_tag=${LATEST_GIT_TAG}"
             echo "tags<<EOF"
-            echo "${DOCKERHUB_IMAGE}:latest"
-            echo "${GHCR_IMAGE}:latest"
-            if [ -n "${LATEST_GIT_TAG}" ]; then
-              echo "${DOCKERHUB_IMAGE}:${LATEST_GIT_TAG}"
-              echo "${GHCR_IMAGE}:${LATEST_GIT_TAG}"
+            if [ "${EVENT_NAME}" = "release" ] && [ -n "${RELEASE_TAG}" ]; then
+              echo "${DOCKERHUB_IMAGE}:latest"
+              echo "${GHCR_IMAGE}:latest"
+              echo "${DOCKERHUB_IMAGE}:${RELEASE_TAG}"
+              echo "${GHCR_IMAGE}:${RELEASE_TAG}"
+            else
+              echo "${DOCKERHUB_IMAGE}:testing"
+              echo "${GHCR_IMAGE}:testing"
             fi
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
