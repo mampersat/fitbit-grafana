@@ -73,10 +73,10 @@ Use the parity tool to bootstrap OAuth and extract a refresh token.
    - Enter Client ID: your Google OAuth client id
    - Enter Client Secret: your Google OAuth client secret
    - Enter same Redirect URI: `http://localhost:8080`
-4. Trigger authentication/re-authentication from Settings.
-5. Complete the Google consent flow in browser - copy the `code=xxxxxxxxxx` part from the redirected url (it will be a `This site can’t be reached` page).
-6. Return to Settings and paste the code. If successful, you will see the refresh token shown by the tool.
-7. Get the refresh token from the here. 
+3. Trigger authentication/re-authentication from Settings.
+4. Complete the Google consent flow in browser - copy the `code=xxxxxxxxxx` part from the redirected url (it will be a `This site can’t be reached` page).
+5. Return to Settings and paste the code. If successful, you will see the refresh token shown by the tool.
+6. Copy and save the refresh token shown there.
 
 Notes:
 
