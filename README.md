@@ -35,6 +35,20 @@ A script to fetch data from Fitbit servers using their API and store the data in
 
 ✅ Available Influxdb database measurements and schema is available [here](extra/influxdb_schema.md)
 
+## Google Health API Migration
+
+Fitbit Web API is being deprecated in favor of the Google Health API. This project now supports a Google provider mode and OAuth token flow for migration.
+
+- Full setup guide: [extra/google-migration.md](extra/google-migration.md)
+- Includes:
+  - Google Cloud setup for `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`
+  - How to obtain refresh token from parity tool Settings
+  - Required redirect URI: `http://localhost:8080`
+  - Compose/env changes (`HEALTH_API_PROVIDER=google`)
+  - Historical fetch validation and troubleshooting
+
+If you are starting a new setup now, follow the Google migration guide first and use Google credentials instead of creating a legacy Fitbit-only OAuth app.
+
 ## Install with Docker (Recommended)
 
 1. Follow this [guide](https://dev.fitbit.com/build/reference/web-api/developer-guide/getting-started/) to create an application. ❗ **The Fitbit `Oauth 2.0 Application Type` selection must be `personal` for intraday data access** ❗- Otherwise you might encounter `KeyError: 'activities-heart-intraday'` when fetching intraday Heart rate or steps data.

@@ -15,6 +15,7 @@ services:
     environment:
       - FITBIT_LOG_FILE_PATH=/app/logs/fitbit.log
       - TOKEN_FILE_PATH=/app/tokens/fitbit.token
+      - HEALTH_API_PROVIDER=fitbit # Supported values: fitbit or google. Keep fitbit until Google endpoint migration is complete.
       - AUTO_DATE_RANGE=True # Switch between regular update and bulk update mode, read Historical Data Update section in README
       - INFLUXDB_VERSION=1 # supports 1 or 2 or 3
       - INFLUXDB_HOST=influxdb # for influxdb 1.x and 3.x
@@ -33,6 +34,9 @@ services:
       # MAKE SURE you set the application type to PERSONAL. Otherwise, you won't have access to intraday data series, resulting in 40X errors.
       - CLIENT_ID=your_application_client_ID # Change this to your client ID
       - CLIENT_SECRET=your_application_client_secret # Change this to your client Secret
+      # Google Health API OAuth credentials (used when HEALTH_API_PROVIDER=google)
+      # - GOOGLE_CLIENT_ID=your_google_cloud_oauth_client_id
+      # - GOOGLE_CLIENT_SECRET=your_google_cloud_oauth_client_secret
       - DEVICENAME=Your_Device_Name # e.g. "Charge5"
       - LOCAL_TIMEZONE=Automatic # set to "Automatic" for Automatic setup from User profile (if not mentioned here specifically). 
     depends_on:

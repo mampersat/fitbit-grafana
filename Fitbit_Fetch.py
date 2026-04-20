@@ -1,7 +1,7 @@
 # %%
 import base64, requests, schedule, time, json, pytz, logging, os, sys
 from requests.exceptions import ConnectionError
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 # for influxdb 1.x
 from influxdb import InfluxDBClient
 from influxdb.exceptions import InfluxDBClientError
@@ -22,6 +22,12 @@ FITBIT_LOG_FILE_PATH = os.environ.get("FITBIT_LOG_FILE_PATH") or "your/expected/
 TOKEN_FILE_PATH = os.environ.get("TOKEN_FILE_PATH") or "your/expected/token/file/location/path"
 OVERWRITE_LOG_FILE = True
 FITBIT_LANGUAGE = 'en_US'
+HEALTH_API_PROVIDER = (os.environ.get("HEALTH_API_PROVIDER") or "fitbit").strip().lower()
+assert HEALTH_API_PROVIDER in ["fitbit", "google"], "HEALTH_API_PROVIDER must be either 'fitbit' or 'google'"
+FITBIT_API_BASE_URL = "https://api.fitbit.com"
+GOOGLE_HEALTH_BASE_URL = os.environ.get("GOOGLE_HEALTH_BASE_URL") or "https://health.googleapis.com"
+GOOGLE_HEALTH_API_VERSION = os.environ.get("GOOGLE_HEALTH_API_VERSION") or "v4"
+GOOGLE_OAUTH_TOKEN_URL = os.environ.get("GOOGLE_OAUTH_TOKEN_URL") or "https://oauth2.googleapis.com/token"
 INFLUXDB_VERSION = os.environ.get("INFLUXDB_VERSION") or "1" # Version of influxdb in use, supported values are 1 or 2
 assert INFLUXDB_VERSION in ['1','2','3'], "Only InfluxDB version 1 or 2 or 3 is allowed - please put either 1 or 2 or 3"
 # Update these variables for influxdb 1.x versions
@@ -39,6 +45,8 @@ INFLUXDB_V3_ACCESS_TOKEN = os.getenv("INFLUXDB_V3_ACCESS_TOKEN",'') # InfluxDB V
 # MAKE SURE you set the application type to PERSONAL. Otherwise, you won't have access to intraday data series, resulting in 40X errors.
 client_id = os.environ.get("CLIENT_ID") or "your_application_client_ID" # Change this to your client ID
 client_secret = os.environ.get("CLIENT_SECRET") or "your_application_client_secret" # Change this to your client Secret
+google_client_id = os.environ.get("GOOGLE_CLIENT_ID") or client_id
+google_client_secret = os.environ.get("GOOGLE_CLIENT_SECRET") or client_secret
 DEVICENAME = os.environ.get("DEVICENAME") or "Your_Device_Name" # e.g. "Charge5"
 ACCESS_TOKEN = "" # Empty Global variable initialization, will be replaced with a functional access code later using the refresh code
 MANUAL_START_DATE = os.getenv("MANUAL_START_DATE", None) # optional, in YYYY-MM-DD format, if you want to bulk update only from specific date
@@ -50,6 +58,7 @@ SCHEDULE_AUTO_UPDATE = True if AUTO_DATE_RANGE else False # Scheduling updates o
 SERVER_ERROR_MAX_RETRY = 3
 EXPIRED_TOKEN_MAX_RETRY = 5
 SKIP_REQUEST_ON_SERVER_ERROR = True
+DRY_RUN_MODE = str(os.environ.get("DRY_RUN_MODE", "False")).lower() in ["true", "1", "yes", "y"]
 
 # %% [markdown]
 # ## Logging setup
@@ -71,18 +80,298 @@ logging.basicConfig(
 # ## Setting up base API Caller function
 
 # %%
+def get_default_auth_headers():
+    if HEALTH_API_PROVIDER == "fitbit":
+        return {
+            "Authorization": f"Bearer {ACCESS_TOKEN}",
+            "Accept": "application/json",
+            "Accept-Language": FITBIT_LANGUAGE
+        }
+    return {
+        "Authorization": f"Bearer {ACCESS_TOKEN}",
+        "Accept": "application/json"
+    }
+
+
+def get_retry_after_seconds(response):
+    # Fitbit and Google use different rate-limit headers; prefer standard Retry-After first.
+    retry_after_header = response.headers.get("Retry-After")
+    if retry_after_header:
+        try:
+            return max(0, int(retry_after_header))
+        except ValueError:
+            pass
+
+    fitbit_reset_header = response.headers.get("Fitbit-Rate-Limit-Reset")
+    if fitbit_reset_header:
+        try:
+            return max(0, int(fitbit_reset_header)) + 300
+        except ValueError:
+            pass
+
+    return 120
+
+
+def get_google_health_api_url(path):
+    return f"{GOOGLE_HEALTH_BASE_URL}/{GOOGLE_HEALTH_API_VERSION}/{path.lstrip('/')}"
+
+
+def request_google_data_points_list(data_type, params=None, suppress_http_error_log=False):
+    endpoint = get_google_health_api_url(f"users/me/dataTypes/{data_type}/dataPoints")
+    return request_data_from_fitbit(endpoint, params=params or {}, suppress_http_error_log=suppress_http_error_log)
+
+
+def request_google_data_points_daily_rollup(data_type, payload):
+    endpoint = get_google_health_api_url(f"users/me/dataTypes/{data_type}/dataPoints:dailyRollUp")
+    headers = get_default_auth_headers()
+    headers["Content-Type"] = "application/json"
+    return request_data_from_fitbit(endpoint, headers=headers, data=json.dumps(payload), request_type="post")
+
+
+def request_google_data_points_rollup(data_type, payload):
+    endpoint = get_google_health_api_url(f"users/me/dataTypes/{data_type}/dataPoints:rollUp")
+    headers = get_default_auth_headers()
+    headers["Content-Type"] = "application/json"
+    return request_data_from_fitbit(endpoint, headers=headers, data=json.dumps(payload), request_type="post")
+
+
+def extract_first_numeric(value):
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped and all(ch in "+-0123456789.eE" for ch in stripped):
+            try:
+                return float(stripped)
+            except ValueError:
+                pass
+    if isinstance(value, dict):
+        for nested in value.values():
+            extracted = extract_first_numeric(nested)
+            if extracted is not None:
+                return extracted
+    if isinstance(value, list):
+        for nested in value:
+            extracted = extract_first_numeric(nested)
+            if extracted is not None:
+                return extracted
+    return None
+
+
+def extract_numeric_fields(value, key_filter=None):
+    fields = {}
+    if not isinstance(value, dict):
+        return fields
+    for key, nested in value.items():
+        if key_filter and key_filter not in key.lower():
+            continue
+        extracted = extract_first_numeric(nested)
+        if extracted is not None:
+            fields[key] = extracted
+    return fields
+
+
+def get_google_payload_key(data_type):
+    parts = data_type.split("-")
+    return parts[0] + "".join(part.capitalize() for part in parts[1:])
+
+
+def get_google_datapoint_payload(data_point, data_type):
+    payload_key = get_google_payload_key(data_type)
+    payload = data_point.get(payload_key)
+    if isinstance(payload, dict):
+        return payload
+    return {}
+
+
+def convert_google_duration_to_seconds(duration_value):
+    if duration_value is None:
+        return None
+    if isinstance(duration_value, (int, float)):
+        return float(duration_value)
+    if isinstance(duration_value, str) and duration_value.endswith("s"):
+        try:
+            return float(duration_value[:-1])
+        except ValueError:
+            return None
+    return None
+
+
+def get_google_datapoint_date_string(data_point, data_type):
+    payload = get_google_datapoint_payload(data_point, data_type)
+
+    if isinstance(payload.get("date"), dict):
+        date_value = payload["date"]
+        try:
+            return f"{int(date_value.get('year')):04d}-{int(date_value.get('month')):02d}-{int(date_value.get('day')):02d}"
+        except (TypeError, ValueError):
+            pass
+
+    interval = payload.get("interval") if isinstance(payload, dict) else None
+    if isinstance(interval, dict):
+        civil_start = interval.get("civilStartTime")
+        if isinstance(civil_start, dict):
+            date_value = civil_start.get("date")
+            if isinstance(date_value, dict):
+                try:
+                    return f"{int(date_value.get('year')):04d}-{int(date_value.get('month')):02d}-{int(date_value.get('day')):02d}"
+                except (TypeError, ValueError):
+                    pass
+
+    return None
+
+
+def parse_google_datapoint_timestamp(data_point, data_type=None):
+    payload = get_google_datapoint_payload(data_point, data_type) if data_type else {}
+
+    time_candidates = [
+        data_point.get("sampleTime"),
+        data_point.get("sample_time"),
+        data_point.get("time"),
+    ]
+
+    if isinstance(payload, dict):
+        time_candidates.extend([
+            payload.get("sampleTime"),
+            payload.get("sample_time"),
+            payload.get("time"),
+        ])
+
+    sample_time = payload.get("sampleTime") if isinstance(payload, dict) else None
+    if isinstance(sample_time, dict):
+        time_candidates.extend([
+            sample_time.get("physicalTime"),
+            sample_time.get("physical_time"),
+        ])
+
+    interval = data_point.get("interval")
+    if isinstance(interval, dict):
+        time_candidates.extend([
+            interval.get("startTime"),
+            interval.get("start_time"),
+            interval.get("civilStartTime"),
+            interval.get("civil_start_time"),
+        ])
+
+    payload_interval = payload.get("interval") if isinstance(payload, dict) else None
+    if isinstance(payload_interval, dict):
+        time_candidates.extend([
+            payload_interval.get("startTime"),
+            payload_interval.get("start_time"),
+            payload_interval.get("endTime"),
+            payload_interval.get("end_time"),
+        ])
+
+    for candidate in time_candidates:
+        if isinstance(candidate, str):
+            normalized = candidate.replace("Z", "+00:00")
+            try:
+                dt = datetime.fromisoformat(normalized)
+                if dt.tzinfo is None:
+                    dt = LOCAL_TIMEZONE.localize(dt)
+                return dt.astimezone(pytz.utc).isoformat()
+            except ValueError:
+                continue
+
+    date_str = get_google_datapoint_date_string(data_point, data_type) if data_type else None
+    if date_str:
+        dt = LOCAL_TIMEZONE.localize(datetime.strptime(date_str + "T00:00:00", "%Y-%m-%dT%H:%M:%S"))
+        return dt.astimezone(pytz.utc).isoformat()
+
+    return None
+
+
+def get_google_datapoints_for_date(data_type, date_str, page_size=10000):
+    start_dt_local = LOCAL_TIMEZONE.localize(datetime.strptime(date_str, "%Y-%m-%d"))
+    end_dt_local = start_dt_local + timedelta(days=1)
+    start_iso = start_dt_local.astimezone(pytz.utc).isoformat().replace("+00:00", "Z")
+    end_iso = end_dt_local.astimezone(pytz.utc).isoformat().replace("+00:00", "Z")
+
+    filter_data_type = data_type.replace("-", "_")
+    next_date_str = (datetime.strptime(date_str, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+
+    # Data types do not expose a uniform set of filter members.
+    if data_type in ["steps"]:
+        filters_to_try = [
+            f'{filter_data_type}.interval.start_time >= "{start_iso}" AND {filter_data_type}.interval.start_time < "{end_iso}"',
+            f'{filter_data_type}.interval.civil_start_time >= "{date_str}T00:00:00" AND {filter_data_type}.interval.civil_start_time < "{next_date_str}T00:00:00"',
+        ]
+    elif data_type in ["heart-rate", "oxygen-saturation", "weight"]:
+        filters_to_try = [
+            f'{filter_data_type}.sample_time.physical_time >= "{start_iso}" AND {filter_data_type}.sample_time.physical_time < "{end_iso}"',
+        ]
+    elif data_type in ["exercise", "sleep"]:
+        filters_to_try = [
+            f'{filter_data_type}.interval.civil_start_time >= "{date_str}T00:00:00" AND {filter_data_type}.interval.civil_start_time < "{next_date_str}T00:00:00"',
+            f'{filter_data_type}.interval.civil_end_time >= "{date_str}T00:00:00" AND {filter_data_type}.interval.civil_end_time < "{next_date_str}T00:00:00"',
+        ]
+    else:
+        # Daily and unsupported data types often reject member-based filters.
+        filters_to_try = []
+
+    response = None
+    used_server_filter = False
+    for filter_expr in filters_to_try:
+        try:
+            response = request_google_data_points_list(
+                data_type,
+                params={"pageSize": page_size, "filter": filter_expr},
+                suppress_http_error_log=True,
+            )
+            used_server_filter = True
+            break
+        except requests.exceptions.HTTPError:
+            continue
+
+    if response is None:
+        response = request_google_data_points_list(data_type, params={"pageSize": page_size})
+
+    points = response.get("dataPoints", []) if isinstance(response, dict) else []
+    filtered = []
+    for data_point in points:
+        ts = parse_google_datapoint_timestamp(data_point, data_type)
+        if not ts:
+            continue
+
+        data_point_date = get_google_datapoint_date_string(data_point, data_type)
+        if used_server_filter:
+            filtered.append((data_point, ts))
+            continue
+
+        if data_point_date == date_str:
+            filtered.append((data_point, ts))
+            continue
+
+        if datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(LOCAL_TIMEZONE).strftime("%Y-%m-%d") == date_str:
+            filtered.append((data_point, ts))
+    return filtered
+
+
+def get_google_datapoints_for_date_range(data_type, start_date_str, end_date_str, page_size=10000):
+    start_date = datetime.strptime(start_date_str, "%Y-%m-%d")
+    end_date = datetime.strptime(end_date_str, "%Y-%m-%d")
+    aggregated = []
+    current = start_date
+    while current <= end_date:
+        aggregated.extend(get_google_datapoints_for_date(data_type, current.strftime("%Y-%m-%d"), page_size=page_size))
+        current += timedelta(days=1)
+    return aggregated
+
+
 # Generic Request caller for all 
-def request_data_from_fitbit(url, headers={}, params={}, data={}, request_type="get"):
+def request_data_from_fitbit(url, headers=None, params=None, data=None, request_type="get", suppress_http_error_log=False):
     global ACCESS_TOKEN
+    headers = headers or {}
+    params = params or {}
+    data = data or {}
     retry_attempts = 0
-    logging.debug("Requesting data from fitbit via Url : " + url)
+    logging.debug("Requesting data from provider '%s' via URL: %s", HEALTH_API_PROVIDER, url)
+    if HEALTH_API_PROVIDER == "google" and url.startswith(FITBIT_API_BASE_URL):
+        raise NotImplementedError("Google provider is enabled but this endpoint is still Fitbit-only. Migrate the caller to a Google Health endpoint first.")
+
     while True: # Unlimited Retry attempts
         if request_type == "get" and headers == {}:
-            headers = {
-                "Authorization": f"Bearer {ACCESS_TOKEN}",
-                "Accept": "application/json",
-                'Accept-Language': FITBIT_LANGUAGE
-            }
+            headers = get_default_auth_headers()
         try:        
             if request_type == "get":
                 response = requests.get(url, headers=headers, params=params, data=data)
@@ -97,16 +386,14 @@ def request_data_from_fitbit(url, headers={}, params={}, data={}, request_type="
                 else:
                     return response.json()
             elif response.status_code == 429: # API Limit reached
-                retry_after = int(response.headers["Fitbit-Rate-Limit-Reset"]) + 300 # Fitbit changed their headers.
-                logging.warning("Fitbit API limit reached. Error code : " + str(response.status_code) + ", Retrying in " + str(retry_after) + " seconds")
-                print("Fitbit API limit reached. Error code : " + str(response.status_code) + ", Retrying in " + str(retry_after) + " seconds")
+                retry_after = get_retry_after_seconds(response)
+                logging.warning("API limit reached for provider '%s'. Error code: %s, retrying in %s seconds", HEALTH_API_PROVIDER, response.status_code, retry_after)
+                print(f"API limit reached for provider '{HEALTH_API_PROVIDER}'. Error code: {response.status_code}, retrying in {retry_after} seconds")
                 time.sleep(retry_after)
             elif response.status_code == 401: # Access token expired ( most likely )
-                logging.info("Current Access Token : " + ACCESS_TOKEN)
-                logging.warning("Error code : " + str(response.status_code) + ", Details : " + response.text)
-                print("Error code : " + str(response.status_code) + ", Details : " + response.text)
+                logging.warning("Error code: %s, provider: %s, details: %s", response.status_code, HEALTH_API_PROVIDER, response.text)
+                print(f"Error code: {response.status_code}, provider: {HEALTH_API_PROVIDER}, details: {response.text}")
                 ACCESS_TOKEN = Get_New_Access_Token(client_id, client_secret)
-                logging.info("New Access Token : " + ACCESS_TOKEN)
                 headers["Authorization"] = f"Bearer {ACCESS_TOKEN}" # Update the renewed ACCESS_TOKEN to the headers dict
                 time.sleep(30)
                 if retry_attempts > EXPIRED_TOKEN_MAX_RETRY:
@@ -121,8 +408,9 @@ def request_data_from_fitbit(url, headers={}, params={}, data={}, request_type="
                         logging.warning("Retry limit reached for server error : Skipping request -> " + url)
                         return None
             else:
-                logging.error("Fitbit API request failed. Status code: " + str(response.status_code) + " " + str(response.text) )
-                print(f"Fitbit API request failed. Status code: {response.status_code}", response.text)
+                if not suppress_http_error_log:
+                    logging.error("API request failed for provider '%s'. Status code: %s %s", HEALTH_API_PROVIDER, response.status_code, response.text)
+                    print(f"API request failed for provider '{HEALTH_API_PROVIDER}'. Status code: {response.status_code}", response.text)
                 response.raise_for_status()
                 return None
 
@@ -136,9 +424,22 @@ def request_data_from_fitbit(url, headers={}, params={}, data={}, request_type="
 # ## Token Refresh Management
 
 # %%
+def save_tokens_to_file(access_token, refresh_token, provider, expires_in=None):
+    tokens = {
+        "provider": provider,
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "saved_at_utc": datetime.now(timezone.utc).isoformat()
+    }
+    if expires_in is not None:
+        tokens["expires_in"] = int(expires_in)
+    with open(TOKEN_FILE_PATH, "w") as file:
+        json.dump(tokens, file)
+
+
 def refresh_fitbit_tokens(client_id, client_secret, refresh_token):
     logging.info("Attempting to refresh tokens...")
-    url = "https://api.fitbit.com/oauth2/token"
+    url = f"{FITBIT_API_BASE_URL}/oauth2/token"
     headers = {
         "Authorization": "Basic " + base64.b64encode((client_id + ":" + client_secret).encode()).decode(),
         "Content-Type": "application/x-www-form-urlencoded"
@@ -147,29 +448,67 @@ def refresh_fitbit_tokens(client_id, client_secret, refresh_token):
         "grant_type": "refresh_token",
         "refresh_token": refresh_token
     }
-    json_data = request_data_from_fitbit(url, headers=headers, data=data, request_type="post")
+    response = requests.post(url, headers=headers, data=data)
+    if response.status_code != 200:
+        logging.error("Fitbit token refresh failed. Status code: %s details: %s", response.status_code, response.text)
+        response.raise_for_status()
+
+    json_data = response.json()
     access_token = json_data["access_token"]
     new_refresh_token = json_data["refresh_token"]
-    tokens = {
-        "access_token": access_token,
-        "refresh_token": new_refresh_token
-    }
-    with open(TOKEN_FILE_PATH, "w") as file:
-        json.dump(tokens, file)
+    save_tokens_to_file(access_token, new_refresh_token, "fitbit", json_data.get("expires_in"))
     logging.info("Fitbit token refresh successful!")
+    return access_token, new_refresh_token
+
+
+def refresh_google_tokens(client_id, client_secret, refresh_token):
+    logging.info("Attempting to refresh Google Health API tokens...")
+    data = {
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token
+    }
+    response = requests.post(GOOGLE_OAUTH_TOKEN_URL, data=data)
+    if response.status_code != 200:
+        logging.error("Google token refresh failed. Status code: %s details: %s", response.status_code, response.text)
+        response.raise_for_status()
+
+    json_data = response.json()
+    access_token = json_data["access_token"]
+    new_refresh_token = json_data.get("refresh_token", refresh_token)
+    save_tokens_to_file(access_token, new_refresh_token, "google", json_data.get("expires_in"))
+    logging.info("Google token refresh successful!")
     return access_token, new_refresh_token
 
 def load_tokens_from_file():
     with open(TOKEN_FILE_PATH, "r") as file:
         tokens = json.load(file)
-        return tokens.get("access_token"), tokens.get("refresh_token")
+        provider = (tokens.get("provider") or "fitbit").lower()
+        return tokens.get("access_token"), tokens.get("refresh_token"), provider
+
+
+def get_active_credentials(client_id, client_secret):
+    if HEALTH_API_PROVIDER == "google":
+        return google_client_id, google_client_secret
+    return client_id, client_secret
 
 def Get_New_Access_Token(client_id, client_secret):
+    active_client_id, active_client_secret = get_active_credentials(client_id, client_secret)
     try:
-        access_token, refresh_token = load_tokens_from_file()
+        access_token, refresh_token, provider_in_file = load_tokens_from_file()
+        if provider_in_file != HEALTH_API_PROVIDER:
+            logging.warning("Token file provider '%s' does not match HEALTH_API_PROVIDER '%s'.", provider_in_file, HEALTH_API_PROVIDER)
     except FileNotFoundError:
-        refresh_token = input("No token file found. Please enter a valid refresh token : ")
-    access_token, refresh_token = refresh_fitbit_tokens(client_id, client_secret, refresh_token)
+        refresh_token = input(f"No token file found. Please enter a valid {HEALTH_API_PROVIDER} refresh token : ")
+
+    if HEALTH_API_PROVIDER == "fitbit":
+        access_token, refresh_token = refresh_fitbit_tokens(active_client_id, active_client_secret, refresh_token)
+    elif HEALTH_API_PROVIDER == "google":
+        access_token, refresh_token = refresh_google_tokens(active_client_id, active_client_secret, refresh_token)
+    else:
+        raise ValueError(f"Unsupported provider: {HEALTH_API_PROVIDER}")
+
     return access_token
 
 ACCESS_TOKEN = Get_New_Access_Token(client_id, client_secret)
@@ -178,7 +517,11 @@ ACCESS_TOKEN = Get_New_Access_Token(client_id, client_secret)
 # ## Influxdb Database Initialization
 
 # %%
-if INFLUXDB_VERSION == "2":
+if DRY_RUN_MODE:
+    influxdbclient = None
+    influxdb_write_api = None
+    logging.warning("DRY_RUN_MODE is enabled. InfluxDB initialization and writes are skipped.")
+elif INFLUXDB_VERSION == "2":
     try:
         influxdbclient = InfluxDBClient2(url=INFLUXDB_URL, token=INFLUXDB_TOKEN, org=INFLUXDB_ORG)
         influxdb_write_api = influxdbclient.write_api(write_options=SYNCHRONOUS)
@@ -215,6 +558,10 @@ else:
     raise InfluxDBClientError("No matching version found. Supported values are 1 and 2 and 3")
 
 def write_points_to_influxdb(points):
+    if DRY_RUN_MODE:
+        logging.info("DRY_RUN_MODE: Skipping InfluxDB write for %s points", len(points))
+        return
+
     if INFLUXDB_VERSION == "2":
         try:
             influxdb_write_api.write(bucket=INFLUXDB_BUCKET, org=INFLUXDB_ORG, record=points)
@@ -244,8 +591,28 @@ def write_points_to_influxdb(points):
 # ## Set Timezone from profile data
 
 # %%
+def get_user_timezone_name():
+    if HEALTH_API_PROVIDER == "fitbit":
+        profile_data = request_data_from_fitbit(f"{FITBIT_API_BASE_URL}/1/user/-/profile.json")
+        return profile_data["user"]["timezone"]
+
+    settings_data = request_data_from_fitbit(f"{GOOGLE_HEALTH_BASE_URL}/{GOOGLE_HEALTH_API_VERSION}/users/me/settings")
+    if isinstance(settings_data, dict):
+        for key in ["timezone", "timeZone", "time_zone"]:
+            if settings_data.get(key):
+                return settings_data.get(key)
+        nested_settings = settings_data.get("settings")
+        if isinstance(nested_settings, dict):
+            for key in ["timezone", "timeZone", "time_zone"]:
+                if nested_settings.get(key):
+                    return nested_settings.get(key)
+
+    logging.warning("Unable to determine timezone from Google settings response. Falling back to UTC")
+    return "UTC"
+
+
 if LOCAL_TIMEZONE == "Automatic":
-    LOCAL_TIMEZONE = pytz.timezone(request_data_from_fitbit("https://api.fitbit.com/1/user/-/profile.json")["user"]["timezone"])
+    LOCAL_TIMEZONE = pytz.timezone(get_user_timezone_name())
 else:
     LOCAL_TIMEZONE = pytz.timezone(LOCAL_TIMEZONE)
 
@@ -279,7 +646,11 @@ def update_working_dates():
 
 # Get last synced battery level of the device
 def get_battery_level():
-    device = request_data_from_fitbit("https://api.fitbit.com/1/user/-/devices.json")[0]
+    if HEALTH_API_PROVIDER == "google":
+        logging.warning("Battery level endpoint is not mapped for Google Health API yet. Skipping DeviceBatteryLevel update.")
+        return
+
+    device = request_data_from_fitbit(f"{FITBIT_API_BASE_URL}/1/user/-/devices.json")[0]
     if device != None:
         collected_records.append({
             "measurement": "DeviceBatteryLevel",
@@ -294,8 +665,51 @@ def get_battery_level():
 
 # For intraday detailed data, max possible range in one day. 
 def get_intraday_data_limit_1d(date_str, measurement_list):
+    if HEALTH_API_PROVIDER == "google":
+        data_type_mapping = {
+            "heart": "heart-rate",
+            "steps": "steps"
+        }
+        for measurement in measurement_list:
+            inserted_count = 0
+            data_type = data_type_mapping.get(measurement[0])
+            if not data_type:
+                logging.warning("Google mapping not available for intraday type: %s", measurement[0])
+                continue
+
+            try:
+                points = get_google_datapoints_for_date(data_type, date_str)
+            except requests.exceptions.HTTPError as err:
+                logging.error("Google intraday fetch failed for %s on %s: %s", data_type, date_str, str(err))
+                continue
+
+            for data_point, ts in points:
+                payload = get_google_datapoint_payload(data_point, data_type)
+                if data_type == "heart-rate":
+                    numeric_value = extract_first_numeric(payload.get("beatsPerMinute"))
+                elif data_type == "steps":
+                    numeric_value = extract_first_numeric(payload.get("count"))
+                else:
+                    numeric_value = extract_first_numeric(payload)
+                if numeric_value is None:
+                    continue
+
+                collected_records.append({
+                    "measurement": measurement[1],
+                    "time": ts,
+                    "tags": {
+                        "Device": DEVICENAME
+                    },
+                    "fields": {
+                        "value": int(numeric_value)
+                    }
+                })
+                inserted_count += 1
+            logging.info("Recorded %s intraday for date %s (Google mode): %s points", measurement[1], date_str, inserted_count)
+        return
+
     for measurement in measurement_list:
-        data = request_data_from_fitbit('https://api.fitbit.com/1/user/-/activities/' + measurement[0] + '/date/' + date_str + '/1d/' + measurement[2] + '.json')["activities-" + measurement[0] + "-intraday"]['dataset']
+        data = request_data_from_fitbit(f"{FITBIT_API_BASE_URL}/1/user/-/activities/{measurement[0]}/date/{date_str}/1d/{measurement[2]}.json")["activities-" + measurement[0] + "-intraday"]['dataset']
         if data != None:
             for value in data:
                 log_time = datetime.fromisoformat(date_str + "T" + value['time'])
@@ -316,8 +730,11 @@ def get_intraday_data_limit_1d(date_str, measurement_list):
 
 # Max range is 30 days, records BR, SPO2 Intraday, skin temp and HRV - 4 queries
 def get_daily_data_limit_30d(start_date_str, end_date_str):
+    if HEALTH_API_PROVIDER == "google":
+        logging.warning("Google mapping for 30-day grouped datasets (HRV/BR/SkinTemp/SPO2 intraday/weight) is not finalized yet. Skipping this batch.")
+        return
 
-    hrv_data_list = request_data_from_fitbit('https://api.fitbit.com/1/user/-/hrv/date/' + start_date_str + '/' + end_date_str + '.json').get('hrv')
+    hrv_data_list = request_data_from_fitbit(f"{FITBIT_API_BASE_URL}/1/user/-/hrv/date/{start_date_str}/{end_date_str}.json").get('hrv')
     if hrv_data_list != None:
         for data in hrv_data_list:
             log_time = datetime.fromisoformat(data["dateTime"] + "T" + "00:00:00")
@@ -338,7 +755,7 @@ def get_daily_data_limit_30d(start_date_str, end_date_str):
         logging.error("Recording failed HRV for date " + start_date_str + " to " + end_date_str)
 
     try:
-        br_response = request_data_from_fitbit('https://api.fitbit.com/1/user/-/br/date/' + start_date_str + '/' + end_date_str + '.json')
+        br_response = request_data_from_fitbit(f"{FITBIT_API_BASE_URL}/1/user/-/br/date/{start_date_str}/{end_date_str}.json")
         br_data_list = br_response.get("br") if br_response else None
     except requests.exceptions.HTTPError as e:
         if e.response is not None and e.response.status_code == 403:
@@ -364,7 +781,7 @@ def get_daily_data_limit_30d(start_date_str, end_date_str):
     else:
         logging.warning("Records not found : BR for date " + start_date_str + " to " + end_date_str)
 
-    skin_temp_data_list = request_data_from_fitbit('https://api.fitbit.com/1/user/-/temp/skin/date/' + start_date_str + '/' + end_date_str + '.json').get("tempSkin")
+    skin_temp_data_list = request_data_from_fitbit(f"{FITBIT_API_BASE_URL}/1/user/-/temp/skin/date/{start_date_str}/{end_date_str}.json").get("tempSkin")
     if skin_temp_data_list != None:
         for temp_record in skin_temp_data_list:
             log_time = datetime.fromisoformat(temp_record["dateTime"] + "T" + "00:00:00")
@@ -384,7 +801,7 @@ def get_daily_data_limit_30d(start_date_str, end_date_str):
         logging.error("Recording failed : Skin Temperature Variation for date " + start_date_str + " to " + end_date_str)
 
     try:
-        spo2_data_list = request_data_from_fitbit('https://api.fitbit.com/1/user/-/spo2/date/' + start_date_str + '/' + end_date_str + '/all.json')
+        spo2_data_list = request_data_from_fitbit(f"{FITBIT_API_BASE_URL}/1/user/-/spo2/date/{start_date_str}/{end_date_str}/all.json")
     except requests.exceptions.HTTPError as e:
         logging.error(f"{e}")
         spo2_data_list = None
@@ -408,7 +825,7 @@ def get_daily_data_limit_30d(start_date_str, end_date_str):
     else:
         logging.error("Recording failed : SPO2 intraday for date " + start_date_str + " to " + end_date_str)
 
-    weight_data_list = request_data_from_fitbit('https://api.fitbit.com/1/user/-/body/log/weight/date/' + start_date_str + '/' + end_date_str + '.json').get("weight")
+    weight_data_list = request_data_from_fitbit(f"{FITBIT_API_BASE_URL}/1/user/-/body/log/weight/date/{start_date_str}/{end_date_str}.json").get("weight")
     if weight_data_list != None:
         for entry in weight_data_list:
             log_time = datetime.fromisoformat(entry["date"] + "T" + entry["time"])
@@ -439,8 +856,11 @@ def get_daily_data_limit_30d(start_date_str, end_date_str):
 
 # Only for sleep data - limit 100 days - 1 query
 def get_daily_data_limit_100d(start_date_str, end_date_str):
+    if HEALTH_API_PROVIDER == "google":
+        logging.warning("Google mapping for sleep detail dataset is not finalized yet. Skipping this batch.")
+        return
 
-    sleep_data = request_data_from_fitbit('https://api.fitbit.com/1.2/user/-/sleep/date/' + start_date_str + '/' + end_date_str + '.json').get("sleep")
+    sleep_data = request_data_from_fitbit(f"{FITBIT_API_BASE_URL}/1.2/user/-/sleep/date/{start_date_str}/{end_date_str}.json").get("sleep")
     if sleep_data != None:
         for record in sleep_data:
             log_time = datetime.fromisoformat(record["startTime"])
@@ -510,9 +930,13 @@ def get_daily_data_limit_100d(start_date_str, end_date_str):
 
 # Max date range 1 year, records HR zones, Activity minutes and Resting HR - 4 + 3 + 1 + 1 = 9 queries
 def get_daily_data_limit_365d(start_date_str, end_date_str):
+    if HEALTH_API_PROVIDER == "google":
+        logging.warning("Google mapping for long-range activity aggregates is not finalized yet. Skipping this batch.")
+        return
+
     activity_minutes_list = ["minutesSedentary", "minutesLightlyActive", "minutesFairlyActive", "minutesVeryActive"]
     for activity_type in activity_minutes_list:
-        activity_minutes_data_list = request_data_from_fitbit('https://api.fitbit.com/1/user/-/activities/tracker/' + activity_type + '/date/' + start_date_str + '/' + end_date_str + '.json').get("activities-tracker-"+activity_type)
+        activity_minutes_data_list = request_data_from_fitbit(f"{FITBIT_API_BASE_URL}/1/user/-/activities/tracker/{activity_type}/date/{start_date_str}/{end_date_str}.json").get("activities-tracker-"+activity_type)
         if activity_minutes_data_list != None:
             for data in activity_minutes_data_list:
                 log_time = datetime.fromisoformat(data["dateTime"] + "T" + "00:00:00")
@@ -534,7 +958,7 @@ def get_daily_data_limit_365d(start_date_str, end_date_str):
 
     activity_others_list = ["distance", "calories", "steps"]
     for activity_type in activity_others_list:
-        activity_others_data_list = request_data_from_fitbit('https://api.fitbit.com/1/user/-/activities/tracker/' + activity_type + '/date/' + start_date_str + '/' + end_date_str + '.json').get("activities-tracker-"+activity_type)
+        activity_others_data_list = request_data_from_fitbit(f"{FITBIT_API_BASE_URL}/1/user/-/activities/tracker/{activity_type}/date/{start_date_str}/{end_date_str}.json").get("activities-tracker-"+activity_type)
         if activity_others_data_list != None:
             for data in activity_others_data_list:
                 log_time = datetime.fromisoformat(data["dateTime"] + "T" + "00:00:00")
@@ -555,7 +979,7 @@ def get_daily_data_limit_365d(start_date_str, end_date_str):
             logging.error("Recording failed : " + activity_name + " for date " + start_date_str + " to " + end_date_str)
         
 
-    HR_zones_data_list = request_data_from_fitbit('https://api.fitbit.com/1/user/-/activities/heart/date/' + start_date_str + '/' + end_date_str + '.json').get("activities-heart")
+    HR_zones_data_list = request_data_from_fitbit(f"{FITBIT_API_BASE_URL}/1/user/-/activities/heart/date/{start_date_str}/{end_date_str}.json").get("activities-heart")
     if HR_zones_data_list != None:
         for data in HR_zones_data_list:
             log_time = datetime.fromisoformat(data["dateTime"] + "T" + "00:00:00")
@@ -589,7 +1013,7 @@ def get_daily_data_limit_365d(start_date_str, end_date_str):
     else:
         logging.error("Recording failed : RHR and HR zones for date " + start_date_str + " to " + end_date_str)
 
-    HR_zone_minutes_list = request_data_from_fitbit('https://api.fitbit.com/1/user/-/activities/active-zone-minutes/date/' + start_date_str + '/' + end_date_str + '.json').get("activities-active-zone-minutes")
+    HR_zone_minutes_list = request_data_from_fitbit(f"{FITBIT_API_BASE_URL}/1/user/-/activities/active-zone-minutes/date/{start_date_str}/{end_date_str}.json").get("activities-active-zone-minutes")
     if HR_zone_minutes_list != None:
         for data in HR_zone_minutes_list:
             log_time = datetime.fromisoformat(data["dateTime"] + "T" + "00:00:00")
@@ -609,8 +1033,45 @@ def get_daily_data_limit_365d(start_date_str, end_date_str):
 
 # records SPO2 single days for the whole given period - 1 query
 def get_daily_data_limit_none(start_date_str, end_date_str):
+    if HEALTH_API_PROVIDER == "google":
+        try:
+            points = get_google_datapoints_for_date_range("daily-oxygen-saturation", start_date_str, end_date_str)
+        except requests.exceptions.HTTPError as e:
+            logging.error("Google daily oxygen saturation fetch failed: %s", str(e))
+            points = []
+
+        if points:
+            inserted_count = 0
+            for data_point, ts in points:
+                spo2_fields = data_point.get("dailyOxygenSaturation", {})
+                avg_value = extract_first_numeric(spo2_fields.get("averagePercentage"))
+                max_value = extract_first_numeric(spo2_fields.get("upperBoundPercentage"))
+                min_value = extract_first_numeric(spo2_fields.get("lowerBoundPercentage"))
+
+                if avg_value is None and max_value is None and min_value is None:
+                    fallback_value = extract_first_numeric(spo2_fields)
+                    avg_value = fallback_value
+
+                collected_records.append({
+                    "measurement": "SPO2",
+                    "time": ts,
+                    "tags": {
+                        "Device": DEVICENAME
+                    },
+                    "fields": {
+                        "avg": avg_value,
+                        "max": max_value,
+                        "min": min_value
+                    }
+                })
+                inserted_count += 1
+            logging.info("Recorded Avg SPO2 for date %s to %s (Google mode): %s points", start_date_str, end_date_str, inserted_count)
+        else:
+            logging.warning("No daily oxygen saturation records found for date %s to %s in Google mode", start_date_str, end_date_str)
+        return
+
     try:
-        data_list = request_data_from_fitbit('https://api.fitbit.com/1/user/-/spo2/date/' + start_date_str + '/' + end_date_str + '.json')
+        data_list = request_data_from_fitbit(f"{FITBIT_API_BASE_URL}/1/user/-/spo2/date/{start_date_str}/{end_date_str}.json")
     except requests.exceptions.HTTPError as e:
         logging.error(f"{e}")
         data_list = None
@@ -697,8 +1158,55 @@ def get_tcx_data(tcx_url, ActivityID):
 
 # Fetches latest activities from record ( upto last 50 )
 def fetch_latest_activities(end_date_str):
+    if HEALTH_API_PROVIDER == "google":
+        try:
+            points = get_google_datapoints_for_date("exercise", end_date_str, page_size=25)
+        except requests.exceptions.HTTPError as err:
+            logging.error("Google exercise fetch failed for %s: %s", end_date_str, str(err))
+            points = []
+
+        inserted_count = 0
+        for data_point, ts in points:
+            exercise_payload = data_point.get("exercise", {})
+            fields = {}
+            metrics_summary = exercise_payload.get("metricsSummary", {}) if isinstance(exercise_payload, dict) else {}
+
+            active_duration_seconds = convert_google_duration_to_seconds(exercise_payload.get("activeDuration"))
+            if active_duration_seconds is not None:
+                fields["ActiveDuration"] = int(active_duration_seconds)
+                fields["duration"] = int(active_duration_seconds)
+
+            average_hr = extract_first_numeric(metrics_summary.get("averageHeartRateBeatsPerMinute"))
+            if average_hr is not None:
+                fields["AverageHeartRate"] = int(average_hr)
+
+            calories_kcal = extract_first_numeric(metrics_summary.get("caloriesKcal"))
+            if calories_kcal is not None:
+                fields["calories"] = int(calories_kcal)
+
+            steps_count = extract_first_numeric(metrics_summary.get("steps"))
+            if steps_count is not None:
+                fields["steps"] = int(steps_count)
+
+            distance_value = extract_first_numeric(metrics_summary.get("distanceMeters"))
+            if distance_value is not None:
+                fields["distance"] = float(distance_value)
+
+            extracted_activity_name = exercise_payload.get("displayName") or exercise_payload.get("exerciseType") or "Unknown-Activity"
+            collected_records.append({
+                "measurement": "Activity Records",
+                "time": ts,
+                "tags": {
+                    "ActivityName": extracted_activity_name
+                },
+                "fields": fields
+            })
+            inserted_count += 1
+        logging.info("Fetched recent exercises for date %s (Google mode): %s points", end_date_str, inserted_count)
+        return
+
     next_end_date_str = (datetime.strptime(end_date_str, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
-    recent_activities_data = request_data_from_fitbit('https://api.fitbit.com/1/user/-/activities/list.json', params={'beforeDate': next_end_date_str, 'sort':'desc', 'limit':50, 'offset':0})
+    recent_activities_data = request_data_from_fitbit(f"{FITBIT_API_BASE_URL}/1/user/-/activities/list.json", params={'beforeDate': next_end_date_str, 'sort':'desc', 'limit':50, 'offset':0})
     TCX_record_count, TCX_record_limit = 0,10
     if recent_activities_data != None:
         for activity in recent_activities_data['activities']:
