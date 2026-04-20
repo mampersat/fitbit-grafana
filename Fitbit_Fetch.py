@@ -59,6 +59,12 @@ SERVER_ERROR_MAX_RETRY = 3
 EXPIRED_TOKEN_MAX_RETRY = 5
 SKIP_REQUEST_ON_SERVER_ERROR = True
 DRY_RUN_MODE = str(os.environ.get("DRY_RUN_MODE", "False")).lower() in ["true", "1", "yes", "y"]
+LOG_LEVEL_NAME = (os.environ.get("LOG_LEVEL") or "DEBUG").strip().upper()
+LOG_LEVEL = getattr(logging, LOG_LEVEL_NAME, None)
+if not isinstance(LOG_LEVEL, int):
+    print(f"Invalid LOG_LEVEL '{LOG_LEVEL_NAME}'. Falling back to DEBUG.")
+    LOG_LEVEL = logging.DEBUG
+    LOG_LEVEL_NAME = "DEBUG"
 
 # %% [markdown]
 # ## Logging setup
@@ -68,13 +74,14 @@ if OVERWRITE_LOG_FILE:
     with open(FITBIT_LOG_FILE_PATH, "w"): pass
 
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=LOG_LEVEL,
     format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[
         logging.FileHandler(FITBIT_LOG_FILE_PATH, mode='a'),
         logging.StreamHandler(sys.stdout)
     ]
 )
+logging.info("Logging level set to %s", LOG_LEVEL_NAME)
 
 # %% [markdown]
 # ## Setting up base API Caller function

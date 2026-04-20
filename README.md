@@ -37,13 +37,13 @@ A script to fetch data from Fitbit servers using their API and store the data in
 
 ## Google Health API Migration
 
-Fitbit Web API is being deprecated in favor of the Google Health API. This project now supports a Google provider mode and OAuth token flow for migration.
+> [!IMPORTANT]
+> Fitbit Web API is being deprecated in favor of the Google Health API. This project now supports a Google provider mode and OAuth token flow for migration.
 
 - Full setup guide: [extra/google-migration.md](extra/google-migration.md)
 - Includes:
   - Google Cloud setup for `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`
   - How to obtain refresh token from parity tool Settings
-  - Required redirect URI: `http://localhost:8080`
   - Compose/env changes (`HEALTH_API_PROVIDER=google`)
   - Historical fetch validation and troubleshooting
 
@@ -51,11 +51,12 @@ If you are starting a new setup now, follow the Google migration guide first and
 
 ## Install with Docker (Recommended)
 
-1. Follow this [guide](https://dev.fitbit.com/build/reference/web-api/developer-guide/getting-started/) to create an application. ❗ **The Fitbit `Oauth 2.0 Application Type` selection must be `personal` for intraday data access** ❗- Otherwise you might encounter `KeyError: 'activities-heart-intraday'` when fetching intraday Heart rate or steps data.
+1. ~~Follow this [guide](https://dev.fitbit.com/build/reference/web-api/developer-guide/getting-started/) to create an application. ❗ **The Fitbit `Oauth 2.0 Application Type` selection must be `personal` for intraday data access** ❗- Otherwise you might encounter `KeyError: 'activities-heart-intraday'` when fetching intraday Heart rate or steps data.~~
 
-![image](https://github.com/user-attachments/assets/323884a6-8154-477b-811b-6e75b90f53f8)
+> [!NOTE]
+> Fitbit Web API is being deprecated in favor of the Google Health API. Please follow the [Google migration guide](extra/google-migration.md) for new setups.
 
-2. `Default Access Type` should be `Read Only`. For the Privacy Policy and TOS URLs, you can enter any valid URL links. Those won't be checked or verified as long as they are valid URLs. The `Redirect URL` could be anything that does not redirect to any existing page/service (as the redirected page url will contain some tokens), I suggest using a dummy `http://localhost:8888` or `http://localhost:8000`. This process will give you a `client ID`, `client secret`, and then you must follow the Oauth 2.0 Tutorial link (marked with `2` above; if you get 403 Forbidden, use the following link instead: [Oauth 2.0 Tutorial](https://dev.fitbit.com/build/reference/web-api/troubleshooting-guide/oauth2-tutorial/)) to receive the required `refresh token` for the setup (see step `5`) 
+2. ~~`Default Access Type` should be `Read Only`. For the Privacy Policy and TOS URLs, you can enter any valid URL links. Those won't be checked or verified as long as they are valid URLs. The `Redirect URL` could be anything that does not redirect to any existing page/service (as the redirected page url will contain some tokens), I suggest using a dummy `http://localhost:8888` or `http://localhost:8000`. This process will give you a `client ID`, `client secret`, and then you must follow the Oauth 2.0 Tutorial link (marked with `2` above; if you get 403 Forbidden, use the following link instead: [Oauth 2.0 Tutorial](https://dev.fitbit.com/build/reference/web-api/troubleshooting-guide/oauth2-tutorial/)) to receive the required `refresh token` for the setup (see step `5`)~~
 
 3. Create a folder named `fitbit-fetch-data`, cd into the folder, create a `compose.yml` file with the content of the given compose example below ( Change the enviornment variables accordingly )
 
@@ -99,6 +100,7 @@ services:
     environment:
       - FITBIT_LOG_FILE_PATH=/app/logs/fitbit.log
       - TOKEN_FILE_PATH=/app/tokens/fitbit.token
+      - LOG_LEVEL=DEBUG # Valid values: DEBUG, INFO, WARNING, ERROR, CRITICAL
       - AUTO_DATE_RANGE=True # Used for bulk update, read Historical Data Update section in README
       - INFLUXDB_VERSION=1
       - INFLUXDB_HOST=influxdb
@@ -217,6 +219,7 @@ Update the following variables in the python script ( use the influxdb-v2 specif
 
 - FITBIT_LOG_FILE_PATH = "your/expected/log/file/location/path"
 - TOKEN_FILE_PATH = "your/expected/token/file/location/path"
+- LOG_LEVEL = "DEBUG" # Valid values: DEBUG, INFO, WARNING, ERROR, CRITICAL
 - INFLUXDB_USERNAME = 'your_influxdb_username'
 - INFLUXDB_PASSWORD = 'your_influxdb_password'
 - INFLUXDB_DATABASE = 'your_influxdb_database_name'

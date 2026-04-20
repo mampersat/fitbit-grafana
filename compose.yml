@@ -15,6 +15,7 @@ services:
     environment:
       - FITBIT_LOG_FILE_PATH=/app/logs/fitbit.log
       - TOKEN_FILE_PATH=/app/tokens/fitbit.token
+      - LOG_LEVEL=DEBUG # Valid values: DEBUG, INFO, WARNING, ERROR, CRITICAL
       - HEALTH_API_PROVIDER=fitbit # Supported values: fitbit or google. Keep fitbit until Google endpoint migration is complete.
       - AUTO_DATE_RANGE=True # Switch between regular update and bulk update mode, read Historical Data Update section in README
       - INFLUXDB_VERSION=1 # supports 1 or 2 or 3

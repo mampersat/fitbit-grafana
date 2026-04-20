@@ -46,13 +46,13 @@ Google uses URL scopes. Use only what you need. Typical read-only scopes for thi
 1. Open Google Cloud Console:
    - https://console.cloud.google.com
 2. Create or select a project.
-3. Enable Google Health API for the project from services.
+3. Enable **Google Health API** for the project from services.
 4. Configure OAuth consent screen:
    - Set app information
-   - Add required test users if app is in Testing mode
+   - Add required test users who can use the app (add yourself) if app is in Testing mode (from the Audience tab of sidebar) or make the app public. Otherwise you will get an access denied error.
 5. Create OAuth credentials:
    - APIs & Services -> Credentials -> Create Credentials -> OAuth client ID
-   - Application type: typically Desktop app
+   - Application type: Desktop app
 6. Add redirect URI exactly:
    - `http://localhost:8080`
 7. Save and copy:
@@ -72,11 +72,11 @@ Use the parity tool to bootstrap OAuth and extract a refresh token.
 2. In OAuth configuration inside Settings:
    - Enter Client ID: your Google OAuth client id
    - Enter Client Secret: your Google OAuth client secret
-   - Enter Redirect URI: `http://localhost:8080`
+   - Enter same Redirect URI: `http://localhost:8080`
 4. Trigger authentication/re-authentication from Settings.
-5. Complete the Google consent flow in browser.
-6. Return to Settings and copy the refresh token shown by the tool.
-7. Get the code part from the url and paste it to get the Acces and Refresh token pair
+5. Complete the Google consent flow in browser - copy the `code=xxxxxxxxxx` part from the redirected url (it will be a `This site can’t be reached` page).
+6. Return to Settings and paste the code. If successful, you will see the refresh token shown by the tool.
+7. Get the refresh token from the here. 
 
 Notes:
 
@@ -92,7 +92,7 @@ Required environment variables:
 - `HEALTH_API_PROVIDER=google`
 - `GOOGLE_CLIENT_ID=<your_client_id>`
 - `GOOGLE_CLIENT_SECRET=<your_client_secret>`
-- `TOKEN_FILE_PATH=/app/tokens/fitbit.token` (or your preferred location)
+- `TOKEN_FILE_PATH=/app/tokens/fitbit.token` (or your preferred location) - delete any existing token file you might have before you started the migration.
 
 Existing variables still required for database/write pipeline:
 
@@ -103,40 +103,28 @@ Existing variables still required for database/write pipeline:
 
 Optional for local validation without DB writes:
 
-- `DRY_RUN_MODE=true`
+- `DRY_RUN_MODE=true` but this will skip any database writes so don't use this for actual migration.
 
 ## 5) First Run / Token Bootstrap
 
-After setting env vars, run one interactive start:
+After setting appropriate env vars, run one interactive start:
 
 ```bash
-HEALTH_API_PROVIDER=google \
-GOOGLE_CLIENT_ID="<client_id>" \
-GOOGLE_CLIENT_SECRET="<client_secret>" \
-TOKEN_FILE_PATH="/tmp/google_health_test.token" \
-FITBIT_LOG_FILE_PATH="/tmp/google_health_test.log" \
-/home/arpan/Documents/fitbit-grafana/.venv/bin/python Fitbit_Fetch.py
+docker compose run fitbit-fetch-data
 ```
 
 When prompted, paste the refresh token obtained from parity tool Settings.
 
 The script will refresh access token and persist token metadata to `TOKEN_FILE_PATH`.
 
+stop the container after the first run with `ctrl+c` and then run the container again with `docker compose down && docker compose up -d` to start the container in detached mode.
+
 ## 6) Validate Historical Fetch
 
-Example one-day historical run:
+Example historical fetch run:
 
 ```bash
-HEALTH_API_PROVIDER=google \
-DRY_RUN_MODE=true \
-GOOGLE_CLIENT_ID="<client_id>" \
-GOOGLE_CLIENT_SECRET="<client_secret>" \
-AUTO_DATE_RANGE=False \
-MANUAL_START_DATE="2024-08-20" \
-MANUAL_END_DATE="2024-08-20" \
-TOKEN_FILE_PATH="/tmp/google_health_test.token" \
-FITBIT_LOG_FILE_PATH="/tmp/google_health_test_2024.log" \
-/home/arpan/Documents/fitbit-grafana/.venv/bin/python Fitbit_Fetch.py
+AUTO_DATE_RANGE=False MANUAL_START_DATE="2024-08-20" docker compose run --rm fitbit-fetch-data
 ```
 
 Use `DRY_RUN_MODE=true` while validating API shape/parsing before writing to InfluxDB.
