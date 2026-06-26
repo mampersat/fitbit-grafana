@@ -1,0 +1,11 @@
+2026-06-26 15:40:39,444 - INFO - Logging level set to DEBUG
+2026-06-26 15:40:41,838 - INFO - Attempting to refresh tokens...
+2026-06-26 15:40:41,842 - DEBUG - Starting new HTTPS connection (1): api.fitbit.com:443
+2026-06-26 15:40:41,963 - DEBUG - https://api.fitbit.com:443 "POST /oauth2/token HTTP/1.1" 401 None
+2026-06-26 15:40:41,964 - ERROR - Fitbit token refresh failed. Status code: 401 details: {
+  "success": false,
+  "errors": [{
+    "errorType": "invalid_client",
+    "message": "Invalid authorization header. Client id invalid. Visit https://dev.fitbit.com/docs/oauth2 for more information on the Fitbit Web API authorization process."
+  }]
+}
